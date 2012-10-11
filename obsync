@@ -704,9 +704,8 @@ class S3Store(Store):
         return Object(obj.name, etag_to_md5(k.etag), k.size, s3_key_to_meta(k))
 
     def upload(self, local_copy, src_acl, obj):
-        if (opts.more_verbose):
-            print "S3Store.UPLOAD: local_copy.path='" + local_copy.path + "' " + \
-                "obj='" + obj.name + "'"
+        vvprint("S3Store.UPLOAD: local_copy.path='" + local_copy.path + "' " + \
+            "obj='" + obj.name + "'")
         if (opts.dry_run):
             return
         k = Key(self.bucket)
@@ -731,8 +730,7 @@ class S3Store(Store):
         if (opts.dry_run):
             return
         self.bucket.delete_key(obj.name)
-        if (opts.more_verbose):
-            print "S3Store: removed %s" % obj.name
+        vvprint("S3Store: removed %s" % obj.name)
 
 # Some S3 servers offer "eventual consistency."
 # What this means is that after a change has been made, like the creation of an
@@ -758,9 +756,8 @@ def do_with_s3_retries(fn):
                 raise ObsyncTemporaryException(e)
             if (opts.verbose):
                 print "encountered s3 response error: ",
-            if (opts.more_verbose):
-                print str(e) + ": ",
-            if (opts.verbose):
+                if (opts.more_verbose):
+                    print str(e) + ": ",
                 print "retrying operation after " + str(stime) + \
                     " second delay"
             time.sleep(stime)
@@ -849,9 +846,8 @@ class SwiftStore(Store):
         return Object(obj.name, etag_to_md5(o._etag), o.size, swift_object_to_meta(o))
 
     def upload(self, local_copy, src_acl, obj):
-        if (opts.more_verbose):
-            print "SwiftStore.UPLOAD: local_copy.path='" + local_copy.path + "' " + \
-                "obj='" + obj.name + "'"
+        vvprint("SwiftStore.UPLOAD: local_copy.path='" + local_copy.path + "' " + \
+            "obj='" + obj.name + "'")
         if (opts.dry_run):
             return
         o = self.container.create_object(obj.name)
@@ -865,8 +861,7 @@ class SwiftStore(Store):
         if (opts.dry_run):
             return
         self.container.delete_object(obj.name)
-        if (opts.more_verbose):
-            print "SwiftStore: removed %s" % obj.name
+        vvprint("SwiftStore: removed %s" % obj.name)
 
 ###### FileStore #######
 class FileStoreIterator(object):
@@ -927,20 +922,18 @@ class FileStore(Store):
     def locate_object(self, obj):
         path = obj.local_path(self.base)
         found = os.path.isfile(path)
-        if (opts.more_verbose):
-            if (found):
-                print "FileStore::locate_object: found object '" + \
-                    obj.name + "'"
-            else:
-                print "FileStore::locate_object: did not find object '" + \
-                    obj.name + "'"
+        if (found):
+            vvprint("FileStore::locate_object: found object '" + \
+                obj.name + "'")
+        else:
+            vvprint("FileStore::locate_object: did not find object '" + \
+                obj.name + "'")
         if (not found):
             return None
         return Object.from_file(obj.name, path)
     def upload(self, local_copy, src_acl, obj):
-        if (opts.more_verbose):
-            print "FileStore.UPLOAD: local_copy.path='" + local_copy.path + "' " + \
-                "obj='" + obj.name + "'"
+        vvprint("FileStore.UPLOAD: local_copy.path='" + local_copy.path + "' " + \
+            "obj='" + obj.name + "'")
         if (opts.dry_run):
             return
         s = local_copy.path
@@ -956,14 +949,12 @@ class FileStore(Store):
         if (opts.dry_run):
             return
         os.unlink(self.base + "/" + obj.name)
-        if (opts.more_verbose):
-            print "FileStore: removed %s" % obj.name
+        vvprint("FileStore: removed %s" % obj.name)
 
 ###### Functions #######
 def delete_unreferenced(src, dst):
     """ delete everything from dst that is not referenced in src """
-    if (opts.more_verbose):
-        print "handling deletes."
+    vvprint("handling deletes.")
     currently_handling = "destination"
     try:
         dst_all_objects = dst.all_objects()
@@ -1153,9 +1144,8 @@ specify both --delete-before and --delete-after.")
                 "equality!")
 
     currently_handling = "source"
-    if (opts.more_verbose):
-        print "SOURCE: %s, %s, %s (%s)" % (opts.src_host, opts.src_bucket,
-                opts.src_prefix, opts.src_type)
+    vvprint("SOURCE: %s, %s, %s (%s)" %
+        (opts.src_host, opts.src_bucket, opts.src_prefix, opts.src_type))
     try:
         src = Store.make_store(opts.src_type, False, False,
                 getenv("SRC_AKEY", "AKEY"), getenv("SRC_SKEY", "SKEY"),
@@ -1168,9 +1158,8 @@ specify both --delete-before and --delete-after.")
         raise
 
     currently_handling = "destination"
-    if (opts.more_verbose):
-        print "DESTINATION: %s, %s, %s (%s)" % (opts.dst_host, opts.dst_bucket,
-                opts.dst_prefix, opts.dst_type)
+    vvprint("DESTINATION: %s, %s, %s (%s)" %
+        (opts.dst_host, opts.dst_bucket, opts.dst_prefix, opts.dst_type))
     try:
         dst = Store.make_store(opts.dst_type, True, opts.create,
                 getenv("DST_AKEY", "AKEY"), getenv("DST_SKEY", "SKEY"),
@@ -1193,8 +1182,7 @@ specify both --delete-before and --delete-after.")
             sobj = src_all_objects.next()
         except StopIteration:
             break
-        if (opts.more_verbose):
-            print "handling " + sobj.name
+        vvprint("handling " + sobj.name)
         pline = ""
         currently_handling = "destination"
         dobj = dst.locate_object(sobj)
@@ -1254,6 +1242,5 @@ specify both --delete-before and --delete-after.")
 except Exception, e:
     print_obsync_exception_and_abort(e, currently_handling)
 
-if (opts.more_verbose):
-    print "finished."
+vvprint("finished.")
 sys.exit(0)
