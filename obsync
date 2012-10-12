@@ -88,6 +88,12 @@ DST_CONSISTENCY   Set to 'eventual' if the destination is eventually consistent
 If these environment variables are not given, we will fall back on libboto
 defaults.
 
+If you are migrating objects with names using unicode characters outside the
+ascii range, make sure that your encodings are configured properly or obsync
+will throw UnicodeEncodeError or UnicodeDecodeError.  One way to do this is to
+set the PYTHONIOENCODING environment variable to a sufficient encoding such as
+UTF-8.
+
 Note: if python-cloudfiles is not installed, swift stores will not be able
 to be synced.
 """
