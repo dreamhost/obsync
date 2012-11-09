@@ -19,16 +19,20 @@ from boto.s3.connection import OrdinaryCallingFormat
 from boto.s3.connection import SubdomainCallingFormat
 from boto.s3.connection import S3Connection
 from boto.s3.key import Key
-from optparse import OptionParser
-from sys import stderr
 from lxml import etree
+from multiprocessing.pool import IMapIterator
+from optparse import OptionParser
+from StringIO import StringIO
+from tempfile import NamedTemporaryFile
 import base64
 import boto
+import codecs
 import errno
 import hashlib
+import logging
 import mimetypes
+import multiprocessing as mp
 import os
-from StringIO import StringIO
 import re
 import shutil
 import string
@@ -102,14 +106,16 @@ ACL_XATTR = "rados.acl"
 META_XATTR_PREFIX = "rados.meta."
 CONTENT_TYPE_XATTR = "rados.content_type"
 
-def vvprint(s):
+def vvprint(s, stream=None):
     if (opts.more_verbose):
-        print s
+        if stream is None:
+            stream = sys.stdout
+        print >>stream, s
 
 ###### Exception classes #######
 class ObsyncException(Exception):
     def __init__(self, ty, e):
-        if (isinstance(e, str)):
+        if (isinstance(e, basestring)):
             # from a string
             self.tb = "".join(traceback.format_stack())
             self.comment = e
@@ -118,6 +124,8 @@ class ObsyncException(Exception):
             self.tb = traceback.format_exc(100000)
             self.comment = None
         self.ty = ty
+        args = (ty, e if isinstance(e, basestring) else repr(e))
+        super(ObsyncException, self).__init__(args)
 
 """ A temporary obsync exception.
 The user may want to retry the operation that failed.
@@ -140,23 +148,28 @@ class ObsyncArgumentParsingException(ObsyncException):
     def __init__(self, e):
         ObsyncException.__init__(self, "argument_parsing", e)
 
-""" Print out some exception information and exit the program.
-Normally, this function expects to see Obsync exceptions. If a random exception
-slips through, we treat it as an unknown error type.
-"""
-def print_obsync_exception_and_abort(e, origin):
+def print_obsync_exception(e, origin, abort=False):
+    """ Print out some exception information and optionally abort.
+    Normally, this function expects to see Obsync exceptions. If a random
+    exception slips through, we treat it as an unknown error type.  Optionally
+    exit the program if abort is True.
+    """
+    if hasattr(e, 'obsync_origin'):
+        # If obsync_origin is set for the exception, use the exception's value
+        # instead of whatever was passed in.
+        origin = e.obsync_origin
     if (isinstance(e, ObsyncException)):
         if (isinstance(e, ObsyncArgumentParsingException)):
-            print >>stderr, USAGE
+            print >>sys.stderr, USAGE
         else:
-            print >>stderr, e.tb
+            print >>sys.stderr, e.tb
         if (e.comment != None):
-            print >>stderr, e.comment
-        print >>stderr, ("ERROR TYPE: %s, ORIGIN: %s" % (e.ty, origin))
-        sys.exit(1)
+            print >>sys.stderr, e.comment
+        print >>sys.stderr, ("ERROR TYPE: %s, ORIGIN: %s" % (e.ty, origin))
     else:
-        traceback.print_exc(100000, stderr)
-        print >>stderr, "ERROR TYPE: unknown, ORIGIN: %s" % origin
+        traceback.print_exc(100000, sys.stderr)
+
+    if abort:
         sys.exit(1)
 
 ###### Extended Attributes #######
@@ -170,7 +183,7 @@ def test_xattr_support(path):
             raise ObsyncPermanentException("test_xattr_support: failed to set an xattr and " + \
                 "read it back.")
     except IOError, e:
-        print >>stderr, "**** ERRROR: You do not appear to have xattr support " + \
+        print >>sys.stderr, "**** ERRROR: You do not appear to have xattr support " + \
             "at %s ****" % pa
         raise ObsyncPermanentException(exc)
     finally:
@@ -532,7 +545,7 @@ class Object(object):
     def local_name(self):
         return s3_name_to_local_name(self.name)
     def local_path(self, base):
-        return base + "/" + s3_name_to_local_name(self.name)
+        return local_path_from_name(self.name, base)
     @staticmethod
     def from_file(obj_name, path):
         f = open(path, 'r')
@@ -554,6 +567,9 @@ class Object(object):
                 meta[k] = v
         #print "Object.from_file: path="+path+",md5=" + bytes_to_str(md5) +",size=" + str(size)
         return Object(obj_name, md5, size, meta)
+
+def local_path_from_name(name, base):
+    return base + "/" + s3_name_to_local_name(name)
 
 ###### Store #######
 class Store(object):
@@ -640,15 +656,18 @@ def meta_to_s3_key(key, meta):
 
 class S3StoreIterator(object):
     """S3Store iterator"""
-    def __init__(self, bucket, blrs):
+    def __init__(self, bucket, blrs, name_only=False):
         self.bucket = bucket
         self.blrs = blrs
+        self.name_only = name_only
     def __iter__(self):
         return self
     def next(self):
         # This will raise StopIteration when there are no more objects to
         # iterate on
         key = self.blrs.next()
+        if self.name_only:
+            return key.name
         # Issue a HEAD request to get content-type and other metadata
         k = self.bucket.get_key(key.name)
         ret = Object(key.name, etag_to_md5(key.etag), key.size, s3_key_to_meta(k))
@@ -699,15 +718,16 @@ class S3Store(Store):
             raise ObsyncTemporaryException(e)
         return LocalCopy(obj.name, temp_file, True)
 
-    def all_objects(self):
+    def all_objects(self, name_only=False):
         blrs = self.bucket.list(prefix = self.key_prefix)
-        return S3StoreIterator(self.bucket, blrs.__iter__())
+        return S3StoreIterator(self.bucket, blrs.__iter__(), name_only)
 
     def locate_object(self, obj):
-        k = self.bucket.get_key(obj.name)
+        name = object_name(obj)
+        k = self.bucket.get_key(name)
         if (k == None):
             return None
-        return Object(obj.name, etag_to_md5(k.etag), k.size, s3_key_to_meta(k))
+        return Object(name, etag_to_md5(k.etag), k.size, s3_key_to_meta(k))
 
     def upload(self, local_copy, src_acl, obj):
         vvprint("S3Store.UPLOAD: local_copy.path='" + local_copy.path + "' " + \
@@ -725,11 +745,11 @@ class S3Store(Store):
                     self.bucket.set_xml_acl(xml, k)
                 do_with_s3_retries(fn)
             except boto.exception.S3ResponseError, e:
-                print >>stderr, "ERROR SETTING ACL on object '" + sobj.name + "'"
-                print >>stderr
-                print >>stderr, "************* ACL: *************"
-                print >>stderr, str(xml)
-                print >>stderr, "********************************"
+                print >>sys.stderr, "ERROR SETTING ACL on object '" + sobj.name + "'"
+                print >>sys.stderr
+                print >>sys.stderr, "************* ACL: *************"
+                print >>sys.stderr, str(xml)
+                print >>sys.stderr, "********************************"
                 raise ObsyncTemporaryException(e)
 
     def remove(self, obj):
@@ -790,15 +810,18 @@ def meta_to_swift_object(obj, meta):
 
 class SwiftStoreIterator(object):
     """SwiftStore iterator"""
-    def __init__(self, container, object_list):
+    def __init__(self, container, object_list, name_only=False):
         self.container = container
         self.generator = (o for o in object_list)
+        self.name_only = name_only
     def __iter__(self):
         return self
     def next(self):
         # This will raise StopIteration when there are no more objects to
         # iterate on
         obj = self.generator.next()
+        if self.name_only:
+            return obj.name
         obj = self.container.get_object(obj.name)
         ret = Object(obj.name, etag_to_md5(obj._etag), obj.size, swift_object_to_meta(obj))
         return ret
@@ -840,16 +863,17 @@ class SwiftStore(Store):
             raise ObsyncTemporaryException(e)
         return LocalCopy(obj.name, temp_file, True)
 
-    def all_objects(self):
+    def all_objects(self, name_only=False):
         object_list = self.container.get_objects(prefix = self.object_prefix)
-        return SwiftStoreIterator(self.container, object_list)
+        return SwiftStoreIterator(self.container, object_list, name_only)
 
     def locate_object(self, obj):
+        name = object_name(obj)
         try:
-            o = self.container.get_object(obj.name)
+            o = self.container.get_object(name)
         except cloudfiles.errors.NoSuchObject:
             return None
-        return Object(obj.name, etag_to_md5(o._etag), o.size, swift_object_to_meta(o))
+        return Object(name, etag_to_md5(o._etag), o.size, swift_object_to_meta(o))
 
     def upload(self, local_copy, src_acl, obj):
         vvprint("SwiftStore.UPLOAD: local_copy.path='" + local_copy.path + "' " + \
@@ -872,7 +896,7 @@ class SwiftStore(Store):
 ###### FileStore #######
 class FileStoreIterator(object):
     """FileStore iterator"""
-    def __init__(self, base):
+    def __init__(self, base, name_only=False):
         self.base = base
         if (opts.follow_symlinks):
             self.generator = os.walk(base, followlinks=True)
@@ -880,6 +904,7 @@ class FileStoreIterator(object):
             self.generator = os.walk(base)
         self.path = ""
         self.files = []
+        self.name_only = name_only
     def __iter__(self):
         return self
     def next(self):
@@ -893,6 +918,8 @@ class FileStoreIterator(object):
             if (not os.path.isfile(path)):
                 continue
             obj_name = local_name_to_s3_name(path[len(self.base)+1:])
+            if self.name_only:
+                return obj_name
             return Object.from_file(obj_name, path)
 
 class FileStore(Store):
@@ -923,20 +950,20 @@ class FileStore(Store):
         return LocalAcl.from_xml(obj.name, xml)
     def make_local_copy(self, obj):
         return LocalCopy(obj.name, obj.local_path(self.base), False)
-    def all_objects(self):
-        return FileStoreIterator(self.base)
+    def all_objects(self, name_only=False):
+        return FileStoreIterator(self.base, name_only)
     def locate_object(self, obj):
-        path = obj.local_path(self.base)
+        name = object_name(obj)
+        path = local_path_from_name(name, self.base)
         found = os.path.isfile(path)
         if (found):
-            vvprint("FileStore::locate_object: found object '" + \
-                obj.name + "'")
+            vvprint("FileStore::locate_object: found object '" + name + "'")
         else:
-            vvprint("FileStore::locate_object: did not find object '" + \
-                obj.name + "'")
+            vvprint("FileStore::locate_object: did not find object '" +
+                name + "'")
         if (not found):
             return None
-        return Object.from_file(obj.name, path)
+        return Object.from_file(name, path)
     def upload(self, local_copy, src_acl, obj):
         vvprint("FileStore.UPLOAD: local_copy.path='" + local_copy.path + "' " + \
             "obj='" + obj.name + "'")
@@ -957,6 +984,38 @@ class FileStore(Store):
         os.unlink(self.base + "/" + obj.name)
         vvprint("FileStore: removed %s" % obj.name)
 
+class OutputRedirectingStoreIterator(object):
+    """Wrap a S3, Swift, or FileStoreIterator to initialize output streams
+
+    Creates new streams using capture_output and captures any output from
+    the StoreIterator before returning a tuple of the next item from the
+    StoreIterator and the streams for further appending.
+
+    """
+    def __init__(self, StoreIterator):
+        self.iterator = StoreIterator
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        (old_stdout, old_stderr, new_stdout, new_stderr) = capture_output()
+        got_object = False
+        try:
+            obj = self.iterator.next()
+            got_object = True
+        finally:
+            restore_output(old_stdout, old_stderr)
+            if not got_object:
+                # Likely a StopIteration, but if we didn't get an object, we
+                # won't be using these buffers again anyway, since we won't
+                # be returning them
+                cleanup_capture_file(new_stdout)
+                cleanup_capture_file(new_stderr)
+        return (obj, new_stdout, new_stderr)
+
+
+
 ###### Functions #######
 def delete_unreferenced(src, dst):
     """ delete everything from dst that is not referenced in src """
@@ -974,7 +1033,7 @@ def delete_unreferenced(src, dst):
     except StopIteration:
         pass
     except Exception, e:
-        print_obsync_exception_and_abort(e, currently_handling)
+        print_obsync_exception(e, currently_handling, abort=True)
 
 def xuser_cb(opt, opt_str, value, parser):
     """ handle an --xuser argument """
@@ -999,199 +1058,245 @@ we are already translating \"%s\" to \"%s\"; we cannot translate it \
 to \"%s\"" % (src_user, xuser[src_user], dst_user))
     xuser[src_user] = dst_user
 
-############Begin#############
-try:
-    currently_handling = "unknown"
-    parser = OptionParser(USAGE)
-    parser.add_option("--src-type", dest="src_type", type="string",
-        action="store", help="type of data  store for source. Can be " + \
-        "'file', 's3', or 'swift'")
-    parser.add_option("--src-path", dest="src_path", type="string",
-        action="store", help="local file path for source")
-    parser.add_option("--src-host", dest="src_host", type="string",
-        action="store", help="host to connect to for source data")
-    parser.add_option("--src-authurl", dest="src_authurl", type="string",
-        action="store", help="authurl to connect to for source data")
-    parser.add_option("--src-bucket", dest="src_bucket", type="string",
-        action="store", help="source bucket")
-    parser.add_option("--src-prefix", dest="src_prefix", type="string",
-        action="store", help="object prefix for the source")
-    parser.add_option("--dst-type", dest="dst_type", type="string",
-        action="store", help="type of data  store for destination. Can be " + \
-        "'file', 's3', or 'swift'")
-    parser.add_option("--dst-path", dest="dst_path", type="string",
-        action="store", help="local file path for destination")
-    parser.add_option("--dst-host", dest="dst_host", type="string",
-        action="store", help="host to connect to for destination data")
-    parser.add_option("--dst-authurl", dest="dst_authurl", type="string",
-        action="store", help="authurl to connect to for destination data")
-    parser.add_option("--dst-bucket", dest="dst_bucket", type="string",
-        action="store", help="destination bucket")
-    parser.add_option("--dst-prefix", dest="dst_prefix", type="string",
-        action="store", help="object prefix for the destination")
-    parser.add_option("-n", "--dry-run", action="store_true", \
-        dest="dry_run", default=False)
-    parser.add_option("-c", "--create-dest", action="store_true", \
-        dest="create", help="create the destination if it doesn't already exist")
-    parser.add_option("--delete-before", action="store_true", \
-        dest="delete_before", help="delete objects that aren't in SOURCE from \
-    DESTINATION before transferring any objects")
-    parser.add_option("--boto-retries", dest="boto_retries", type="int",
-        help="set number of times we'll retry the same S3 operation")
-    parser.add_option("-d", "--delete-after", action="store_true", \
-        dest="delete_after", help="delete objects that aren't in SOURCE from \
-    DESTINATION after doing all transfers.")
-    parser.add_option(
-        "--check-etags", default="always",
-        choices=["always", "relaxed", "never"],
-        help=("set whether equality checking relies on source and destination "
-              "etags being the same.  Values are 'always' (the default), "
-              "'relaxed' (skips etags when one or both contains a hyphen due "
-              "to multipart upload), and 'never'."))
-    parser.add_option("-L", "--follow-symlinks", action="store_true", \
-        dest="follow_symlinks", help="follow symlinks (please avoid symlink " + \
-        "loops when using this option!)")
-    parser.add_option("--no-preserve-acls", action="store_true", \
-        dest="no_preserve_acls", help="don't preserve ACLs when copying objects.")
-    parser.add_option("-v", "--verbose", action="store_true", \
-        dest="verbose", help="be verbose")
-    parser.add_option("-V", "--more-verbose", action="store_true", \
-        dest="more_verbose", help="be really, really verbose (developer mode)")
-    parser.add_option("-x", "--xuser", type="string", nargs=1, action="callback", \
-        dest="SRC=DST", callback=xuser_cb, help="set up a user tranlation. You \
-    can specify multiple user translations with multiple --xuser arguments.")
-    parser.add_option("--force", action="store_true", \
-        dest="force", help="overwrite all destination objects, even if they \
-    appear to be the same as the source objects.")
-    parser.add_option("--unit", action="store_true", \
-        dest="run_unit_tests", help="run unit tests and quit")
-    xuser = {}
-    (opts, args) = parser.parse_args()
-    if (opts.run_unit_tests):
-        test_acl_policy()
-        sys.exit(0)
-
-    if opts.boto_retries != None:
-        if not boto.config.has_section('Boto'):
-            boto.config.add_section('Boto')
-        boto.config.set('Boto', 'num_retries', str(opts.boto_retries))
-
-    if (not opts.src_type):
-        raise ObsyncArgumentParsingException("src-type is required!")
-    if (opts.src_type == 'file'):
-        if (opts.src_host or opts.src_bucket or opts.src_prefix or opts.src_authurl):
-            raise ObsyncArgumentParsingException("host, bucket, prefix, and " + \
-                "authurl not required for local file stores.")
-        if (not opts.src_path):
-            raise ObsyncArgumentParsingException("src-path is required!")
+def object_name(obj):
+    """Obtain object name whether given Object or string."""
+    if isinstance(obj, basestring):
+        return obj
     else:
-        if (opts.src_type == 's3'):
-            if (opts.src_authurl):
-                raise ObsyncArgumentParsingException("src-authurl is not used for s3 stores!")
-            if (not opts.src_host):
-                raise ObsyncArgumentParsingException("src-host is required for s3 stores!")
-        if (opts.src_type == 'swift'):
-            if not cloudfiles:
-                raise ObsyncArgumentParsingException("cloudfiles library not found. Swift syncing unavailable")
-            if (not opts.src_authurl):
-                raise ObsyncArgumentParsingException("src-authurl is required for swift stores!")
-            if (opts.src_host):
-                raise ObsyncArgumentParsingException("src-host is not used for swift stores!")
-        if (not opts.src_bucket):
-            raise ObsyncArgumentParsingException("src-bucket is required!")
+        # obj is an Object object
+        return obj.name
 
-    if (not opts.dst_type):
-        raise ObsyncArgumentParsingException("dst-type is required!")
-    if (opts.dst_type == 'file'):
-        if (opts.dst_host or opts.dst_bucket or opts.dst_prefix or opts.dst_authurl):
-            raise ObsyncArgumentParsingException("host, bucket, prefix, and " + \
-                "authurl not required for local file stores.")
-        if (not opts.dst_path):
-            raise ObsyncArgumentParsingException("dst-path is required!")
+def is_file_like(maybe_file):
+    """Determine whether an object implements a file-like interface."""
+    return (hasattr(maybe_file, 'read') and
+        hasattr(maybe_file, 'write') and
+        hasattr(maybe_file, 'seek'))
+
+def capture_sys_handle(new_file, sys_handle_name):
+    """Capture stdout or stderr by reassigning sys.stdout or sys.stderr.
+
+    new_file may be None, meaning that a new tempfile should be created,
+    a string, meaning that a file by that name should be opened, or a
+    file-like object, meaning that it should be used.
+
+    sys_handle_name MUST be one of 'stdout' or 'stderr' since we are
+    explicitly trying to capture sys handles.
+
+    """
+    if sys_handle_name not in ('stdout', 'stderr'):
+        raise ValueError("sys_handle_name expected 'stdout' or 'stderr'")
+
+    if new_file is None:
+        # create a temp file, but get rid of its handle,
+        # since it is designed to close too soon
+        new_file_wrapper = NamedTemporaryFile(
+            prefix='obsync-{0}-'.format(os.getpid()),
+            suffix='.' + sys_handle_name,
+            delete=False)
+        new_file_wrapper.close()
+        new_file = new_file_wrapper.name
+
+    if isinstance(new_file, basestring):
+        new_file_desc = new_file
+        new_file = codecs.open(new_file, mode='a+', encoding='UTF-8')
+        new_file.seek(0, os.SEEK_END)
+    elif is_file_like(new_file):
+        new_file_desc = new_file
     else:
-        if (opts.dst_type == 's3'):
-            if (opts.dst_authurl):
-                raise ObsyncArgumentParsingException("dst-authurl is not used for s3 stores!")
-            if (not opts.dst_host):
-                raise ObsyncArgumentParsingException("dst-host is required for s3 stores!")
-        if (opts.dst_type == 'swift'):
-            if not cloudfiles:
-                raise ObsyncArgumentParsingException("cloudfiles library not found. Swift syncing unavailable")
-            if (not opts.dst_authurl):
-                raise ObsyncArgumentParsingException("dst-authurl is required for swift stores!")
-            if (opts.dst_host):
-                raise ObsyncArgumentParsingException("dst-host is not used for swift stores!")
-        if (not opts.dst_bucket):
-            raise ObsyncArgumentParsingException("dst-bucket is required!")
+        raise TypeError("new_file expected filename or file-like object")
 
-    if opts.src_authurl:
-        opts.src_host = opts.src_authurl
-    if opts.dst_authurl:
-        opts.dst_host = opts.dst_authurl
-    opts.preserve_acls = not opts.no_preserve_acls
-    if (opts.create and opts.dry_run):
-        raise ObsyncArgumentParsingException("You can't run with both \
---create-dest and --dry-run! By definition, a dry run never changes anything.")
+    if sys_handle_name == 'stdout':
+        sys.stdout = new_file
+    elif sys_handle_name == 'stderr':
+        sys.stderr = new_file
 
-    if (opts.more_verbose):
-        print >>stderr, "User translations:"
-        for k,v in xuser.items():
-            print >>stderr, "\"%s\" ==> \"%s\"" % (k, v)
-        print >>stderr, ""
-    if (opts.more_verbose):
-        opts.verbose = True
-        boto.set_stream_logger("stdout")
-        boto.log.info("Enabling verbose boto logging.")
-    if (opts.delete_before and opts.delete_after):
-        raise ObsyncArgumentParsingException("It doesn't make sense to \
-specify both --delete-before and --delete-after.")
-    if opts.check_etags == "never":
-        vvprint("--check-etags=never, skipping etag verification for object "
-                "equality!")
+    return new_file_desc
 
-    currently_handling = "source"
-    vvprint("SOURCE: %s, %s, %s (%s)" %
-        (opts.src_host, opts.src_bucket, opts.src_prefix, opts.src_type))
+def reset_boto_logger(
+        name, new_stderr=None, level=logging.DEBUG, format_string=None):
+    """Hijack the boto logger with a freshly made new logger.
+
+    This method merges the functionality from boto.set_stream_logger and
+    boto.set_file_logger and properly sets the encoding for the FileHandler
+    if a filename is specified.  Also this cleans up old handlers as they
+    are removed so that file handles can be properly released.
+
+    """
+    if not format_string:
+        format_string = "%(asctime)s %(name)s [%(levelname)s]:%(message)s"
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    if new_stderr is None:
+        fh = logging.StreamHandler()
+    elif isinstance(new_stderr, basestring):
+        fh = logging.FileHandler(new_stderr, encoding='UTF-8')
+    elif is_file_like(new_stderr):
+        # Looks like a file to me!
+        fh = logging.StreamHandler(new_stderr)
+    else:
+        raise TypeError("new_stderr expected filename or file-like object")
+
+    fh.setLevel(level)
+    formatter = logging.Formatter(format_string)
+    fh.setFormatter(formatter)
+    # don't let handlers pile up within a worker process
+    for h in logger.handlers:
+        logger.removeHandler(h)
+        h.close()
+    logger.addHandler(fh)
+    boto.log = logger
+
+def capture_output(new_stdout=None, new_stderr=None):
+    """Redirect stdout and stderr and hijack the boto logger.
+
+    If opts.collate_output is False, sys.stdout and sys.stderr remain as they
+    were, and the boto logger is unchanged.  Otherwise capture output by
+    setting sys.stdout and sys.stderr to the specified new streams.  If
+    new_stdout or new_stderr is not provided, a new file will be
+    created for it by capture_sys_handle.
+
+    """
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    if opts.collate_output:
+        new_stdout = capture_sys_handle(new_stdout, 'stdout')
+        new_stderr = capture_sys_handle(new_stderr, 'stderr')
+
+        if opts.more_verbose:
+            stream_name = mp.current_process().name
+            reset_boto_logger(stream_name, new_stderr)
+    else:
+        new_stdout = old_stdout
+        new_stderr = old_stderr
+    return (old_stdout, old_stderr, new_stdout, new_stderr)
+
+def restore_output(old_stdout, old_stderr):
+    """Restore stdout and stderr and reset the boto logger to stderr."""
+    sys.stdout = old_stdout
+    sys.stderr = old_stderr
+    if opts.collate_output and opts.more_verbose:
+        stream_name = mp.current_process().name
+        reset_boto_logger(stream_name)
+
+def print_captured_to_stream(captured, stream, only_vv=False):
+    """Consume captured output to stream, specifying need for verbosity.
+
+    Assumes that if captured is a string, it specifies a filename, so captured
+    is opened as a file, read out to stream, and unlinked when finished.
+
+    This is what cleans up after all the temp files produced when using temp
+    files as the buffers for redirected output.
+
+    """
+    if opts.more_verbose or not only_vv:
+        if isinstance(captured, basestring):
+            cap_file = codecs.open(captured, encoding='UTF-8')
+        else:
+            # Assume captured is file-like
+            cap_file = captured
+
+        cap_file.seek(0)
+        print >>stream, cap_file.read()
+
+    cleanup_capture_file(captured)
+    stream.flush()
+
+def cleanup_capture_file(cap_file):
+    """Perform any needed cleanup for the temporary capture files.
+
+    For now this only performs cleanup if cap_file is a string, and does so by
+    unlinking the file it specifies.
+
+    """
+    if isinstance(cap_file, basestring):
+        os.unlink(cap_file)
+
+def init_stores():
+    """Initialize source and destination Store objects.
+
+    This is used once by the main process and once by every worker process,
+    since each worker must have its own AWSAuthConnection objects if using
+    boto within S3Stores.
+
+    """
     try:
-        src = Store.make_store(opts.src_type, False, False,
-                getenv("SRC_AKEY", "AKEY"), getenv("SRC_SKEY", "SKEY"),
-                host=opts.src_host, bucket=opts.src_bucket,
-                prefix=opts.src_prefix, path=opts.src_path)
-    except ObsyncException, e:
-        if (e.comment == "NonexistentStore"):
-            e.comment = "Fatal error: Source " + opts.src_host + " does " +\
-                "not appear to exist."
-        raise
-
-    currently_handling = "destination"
-    vvprint("DESTINATION: %s, %s, %s (%s)" %
-        (opts.dst_host, opts.dst_bucket, opts.dst_prefix, opts.dst_type))
-    try:
-        dst = Store.make_store(opts.dst_type, True, opts.create,
-                getenv("DST_AKEY", "AKEY"), getenv("DST_SKEY", "SKEY"),
-                host=opts.dst_host, bucket=opts.dst_bucket,
-                prefix=opts.dst_prefix, path=opts.dst_path)
-    except ObsyncException, e:
-        if (e.comment == "NonexistentStore"):
-            e.comment = "Fatal error: Destination does not exist. Run " + \
-                "with -c or --create-dest to create it automatically."
-        raise
-
-    if (opts.delete_before):
-        delete_unreferenced(src, dst)
-
-    currently_handling = "source"
-    src_all_objects = src.all_objects()
-    while True:
         currently_handling = "source"
+        vvprint("SOURCE: %s, %s, %s (%s)" %
+            (opts.src_host, opts.src_bucket, opts.src_prefix, opts.src_type))
         try:
-            sobj = src_all_objects.next()
-        except StopIteration:
-            break
+            src = Store.make_store(opts.src_type, False, False,
+                    getenv("SRC_AKEY", "AKEY"), getenv("SRC_SKEY", "SKEY"),
+                    host=opts.src_host, bucket=opts.src_bucket,
+                    prefix=opts.src_prefix, path=opts.src_path)
+        except ObsyncException, e:
+            if (e.comment == "NonexistentStore"):
+                e.comment = "Fatal error: Source " + opts.src_host + " does " +\
+                    "not appear to exist."
+            raise
+
+        currently_handling = "destination"
+        vvprint("DESTINATION: %s, %s, %s (%s)" %
+            (opts.dst_host, opts.dst_bucket, opts.dst_prefix, opts.dst_type))
+        try:
+            dst = Store.make_store(opts.dst_type, True, opts.create,
+                    getenv("DST_AKEY", "AKEY"), getenv("DST_SKEY", "SKEY"),
+                    host=opts.dst_host, bucket=opts.dst_bucket,
+                    prefix=opts.dst_prefix, path=opts.dst_path)
+        except ObsyncException, e:
+            if (e.comment == "NonexistentStore"):
+                e.comment = "Fatal error: Destination does not exist. Run " + \
+                    "with -c or --create-dest to create it automatically."
+            raise
+        return (src, dst)
+
+    except Exception as e:
+        if not hasattr(e, 'obsync_origin'):
+            e.obsync_origin = currently_handling
+        raise
+    except KeyboardInterrupt as k:
+        print repr(k) + " while initializing stores"
+
+def start_worker(result_queue):
+    """Initialize a worker with new source and destination Stores."""
+    global src_store
+    global dst_store
+    (old_stdout, old_stderr, new_stdout, new_stderr) = capture_output()
+    status = 'failure'
+    try:
+        (src_store, dst_store) = init_stores()
+        status = 'success'
+    except Exception as e:
+        pass
+    finally:
+        restore_output(old_stdout, old_stderr)
+    worker_process = mp.current_process()
+
+    result = dict(
+        worker_name=worker_process.name,
+        status=status,
+        output=new_stdout,
+        error=new_stderr)
+    if status == 'failure':
+        result['exc'] = e
+    result_queue.put(result)
+
+
+def sync_object(args):
+    """Sync object from source store to destination Store."""
+    (sname, new_out, new_err) = args
+    global src_store
+    global dst_store
+    (old_stdout, old_stderr, new_stdout, new_stderr) = capture_output(
+        new_out, new_err)
+    try:
+        currently_handling = "source"
+        sobj = src_store.locate_object(sname)
+        if sobj == None:
+            raise ObsyncTemporaryException("Got sobj = None from source")
         vvprint("handling " + sobj.name)
         pline = ""
         currently_handling = "destination"
-        dobj = dst.locate_object(sobj)
+        dobj = dst_store.locate_object(sobj)
         upload = False
         src_acl = None
         dst_acl = None
@@ -1210,9 +1315,9 @@ specify both --delete-before and --delete-after.")
         elif (opts.preserve_acls):
             # Do the ACLs match?
             currently_handling = "source"
-            src_acl = src.get_acl(sobj)
+            src_acl = src_store.get_acl(sobj)
             currently_handling = "destination"
-            dst_acl = dst.get_acl(dobj)
+            dst_acl = dst_store.get_acl(dobj)
             currently_handling = "source"
             src_acl.translate_users(xuser)
             #src_acl.set_owner()
@@ -1230,23 +1335,271 @@ specify both --delete-before and --delete-after.")
             else:
                 if (src_acl == None):
                     currently_handling = "source"
-                    src_acl = src.get_acl(sobj)
+                    src_acl = src_store.get_acl(sobj)
                     src_acl.translate_users(xuser)
                     #src_acl.set_owner()
             currently_handling = "source"
-            local_copy = src.make_local_copy(sobj)
+            local_copy = src_store.make_local_copy(sobj)
             try:
                 currently_handling = "destination"
-                dst.upload(local_copy, src_acl, sobj)
+                dst_store.upload(local_copy, src_acl, sobj)
             finally:
                 local_copy.remove()
         if (pline != ""):
             print pline
+        return dict(
+            name=sobj.name,
+            status="success",
+            output=new_stdout,
+            error=new_stderr)
+    except Exception as e:
+        if not hasattr(e, 'obsync_origin'):
+            e.obsync_origin = currently_handling
+        return dict(
+            name=sobj.name,
+            status="failure",
+            exc=e,
+            output=new_stdout,
+            error=new_stderr)
+    except KeyboardInterrupt as k:
+        print >>old_stderr, repr(k) + " while migrating " + sobj.name
+    finally:
+        restore_output(old_stdout, old_stderr)
 
-    if (opts.delete_after):
-        delete_unreferenced(src, dst)
-except Exception, e:
-    print_obsync_exception_and_abort(e, currently_handling)
 
-vvprint("finished.")
-sys.exit(0)
+############Begin#############
+if __name__ == "__main__":
+    # Some module-specific fixes
+    reload(sys)
+    sys.setdefaultencoding("UTF-8")
+    # IMapIterator fix adapted from gist.github.com/626518
+    def wrapper(func):
+        def wrap(self, timeout=None):
+            return func(self,
+                        timeout=timeout if timeout is not None else 1e100)
+        return wrap
+    IMapIterator.next = wrapper(IMapIterator.next)
+
+    try:
+        currently_handling = "unknown"
+        parser = OptionParser(USAGE)
+        parser.add_option("--src-type", dest="src_type", type="string",
+            action="store", help="type of data  store for source. Can be " + \
+            "'file', 's3', or 'swift'")
+        parser.add_option("--src-path", dest="src_path", type="string",
+            action="store", help="local file path for source")
+        parser.add_option("--src-host", dest="src_host", type="string",
+            action="store", help="host to connect to for source data")
+        parser.add_option("--src-authurl", dest="src_authurl", type="string",
+            action="store", help="authurl to connect to for source data")
+        parser.add_option("--src-bucket", dest="src_bucket", type="string",
+            action="store", help="source bucket")
+        parser.add_option("--src-prefix", dest="src_prefix", type="string",
+            action="store", help="object prefix for the source")
+        parser.add_option("--dst-type", dest="dst_type", type="string",
+            action="store", help="type of data  store for destination. Can be " + \
+            "'file', 's3', or 'swift'")
+        parser.add_option("--dst-path", dest="dst_path", type="string",
+            action="store", help="local file path for destination")
+        parser.add_option("--dst-host", dest="dst_host", type="string",
+            action="store", help="host to connect to for destination data")
+        parser.add_option("--dst-authurl", dest="dst_authurl", type="string",
+            action="store", help="authurl to connect to for destination data")
+        parser.add_option("--dst-bucket", dest="dst_bucket", type="string",
+            action="store", help="destination bucket")
+        parser.add_option("--dst-prefix", dest="dst_prefix", type="string",
+            action="store", help="object prefix for the destination")
+        parser.add_option("-n", "--dry-run", action="store_true", \
+            dest="dry_run", default=False)
+        parser.add_option("-c", "--create-dest", action="store_true", \
+            dest="create", help="create the destination if it doesn't already exist")
+        parser.add_option("--delete-before", action="store_true", \
+            dest="delete_before", help="delete objects that aren't in SOURCE from \
+        DESTINATION before transferring any objects")
+        parser.add_option("--boto-retries", dest="boto_retries", type="int",
+            help="set number of times we'll retry the same S3 operation")
+        parser.add_option("-d", "--delete-after", action="store_true", \
+            dest="delete_after", help="delete objects that aren't in SOURCE from \
+        DESTINATION after doing all transfers.")
+        parser.add_option(
+            "--check-etags", default="always",
+            choices=["always", "relaxed", "never"],
+            help=("set whether equality checking relies on source and destination "
+                  "etags being the same.  Values are 'always' (the default), "
+                  "'relaxed' (skips etags when one or both contains a hyphen due "
+                  "to multipart upload), and 'never'."))
+        parser.add_option("-L", "--follow-symlinks", action="store_true", \
+            dest="follow_symlinks", help="follow symlinks (please avoid symlink " + \
+            "loops when using this option!)")
+        parser.add_option("--no-preserve-acls", action="store_true", \
+            dest="no_preserve_acls", help="don't preserve ACLs when copying objects.")
+        parser.add_option("-v", "--verbose", action="store_true", \
+            dest="verbose", help="be verbose")
+        parser.add_option("--collate-output", action="store_true", default=True,
+            help=("Redirect and collate output per object migrated into discrete "
+                "sections and avoid splicing due to concurrency - this is the "
+                "default behavior."))
+        parser.add_option("--no-collate-output", action="store_false",
+            dest="collate_output", help="disables output redirection and collation")
+        parser.add_option("-V", "--more-verbose", action="store_true", \
+            dest="more_verbose", help="be really, really verbose (developer mode)")
+        parser.add_option("-w", "--workers", type="int", default=1,
+            help="number of multiprocessing processes to run concurrently")
+        parser.add_option("-x", "--xuser", type="string", nargs=1, action="callback", \
+            dest="SRC=DST", callback=xuser_cb, help="set up a user tranlation. You \
+        can specify multiple user translations with multiple --xuser arguments.")
+        parser.add_option("--force", action="store_true", \
+            dest="force", help="overwrite all destination objects, even if they \
+        appear to be the same as the source objects.")
+        parser.add_option("--unit", action="store_true", \
+            dest="run_unit_tests", help="run unit tests and quit")
+        xuser = {}
+        (opts, args) = parser.parse_args()
+        if (opts.run_unit_tests):
+            test_acl_policy()
+            sys.exit(0)
+
+        if opts.boto_retries != None:
+            if not boto.config.has_section('Boto'):
+                boto.config.add_section('Boto')
+            boto.config.set('Boto', 'num_retries', str(opts.boto_retries))
+
+        if (not opts.src_type):
+            raise ObsyncArgumentParsingException("src-type is required!")
+        if (opts.src_type == 'file'):
+            if (opts.src_host or opts.src_bucket or opts.src_prefix or opts.src_authurl):
+                raise ObsyncArgumentParsingException("host, bucket, prefix, and " + \
+                    "authurl not required for local file stores.")
+            if (not opts.src_path):
+                raise ObsyncArgumentParsingException("src-path is required!")
+        else:
+            if (opts.src_type == 's3'):
+                if (opts.src_authurl):
+                    raise ObsyncArgumentParsingException("src-authurl is not used for s3 stores!")
+                if (not opts.src_host):
+                    raise ObsyncArgumentParsingException("src-host is required for s3 stores!")
+            if (opts.src_type == 'swift'):
+                if not cloudfiles:
+                    raise ObsyncArgumentParsingException("cloudfiles library not found. Swift syncing unavailable")
+                if (not opts.src_authurl):
+                    raise ObsyncArgumentParsingException("src-authurl is required for swift stores!")
+                if (opts.src_host):
+                    raise ObsyncArgumentParsingException("src-host is not used for swift stores!")
+            if (not opts.src_bucket):
+                raise ObsyncArgumentParsingException("src-bucket is required!")
+
+        if (not opts.dst_type):
+            raise ObsyncArgumentParsingException("dst-type is required!")
+        if (opts.dst_type == 'file'):
+            if (opts.dst_host or opts.dst_bucket or opts.dst_prefix or opts.dst_authurl):
+                raise ObsyncArgumentParsingException("host, bucket, prefix, and " + \
+                    "authurl not required for local file stores.")
+            if (not opts.dst_path):
+                raise ObsyncArgumentParsingException("dst-path is required!")
+        else:
+            if (opts.dst_type == 's3'):
+                if (opts.dst_authurl):
+                    raise ObsyncArgumentParsingException("dst-authurl is not used for s3 stores!")
+                if (not opts.dst_host):
+                    raise ObsyncArgumentParsingException("dst-host is required for s3 stores!")
+            if (opts.dst_type == 'swift'):
+                if not cloudfiles:
+                    raise ObsyncArgumentParsingException("cloudfiles library not found. Swift syncing unavailable")
+                if (not opts.dst_authurl):
+                    raise ObsyncArgumentParsingException("dst-authurl is required for swift stores!")
+                if (opts.dst_host):
+                    raise ObsyncArgumentParsingException("dst-host is not used for swift stores!")
+            if (not opts.dst_bucket):
+                raise ObsyncArgumentParsingException("dst-bucket is required!")
+
+        if opts.src_authurl:
+            opts.src_host = opts.src_authurl
+        if opts.dst_authurl:
+            opts.dst_host = opts.dst_authurl
+        opts.preserve_acls = not opts.no_preserve_acls
+        if (opts.create and opts.dry_run):
+            raise ObsyncArgumentParsingException("You can't run with both \
+    --create-dest and --dry-run! By definition, a dry run never changes anything.")
+
+        if (opts.more_verbose):
+            print >>sys.stderr, "User translations:"
+            for k,v in xuser.items():
+                print >>sys.stderr, "\"%s\" ==> \"%s\"" % (k, v)
+            print >>sys.stderr, ""
+        if (opts.more_verbose):
+            opts.verbose = True
+            stream_name = "boto"
+            if opts.collate_output:
+                stream_name = mp.current_process().name
+            reset_boto_logger(stream_name)
+            boto.log.info("Enabling verbose boto logging.")
+        if (opts.delete_before and opts.delete_after):
+            raise ObsyncArgumentParsingException("It doesn't make sense to \
+    specify both --delete-before and --delete-after.")
+        if opts.check_etags == "never":
+            vvprint("--check-etags=never, skipping etag verification for object "
+                    "equality!")
+
+        (src, dst) = init_stores()
+
+        if (opts.delete_before):
+            delete_unreferenced(src, dst)
+
+        # capture original stdout and stderr because the src_all_objects
+        # iterator manipulates stdout and stderr
+        orig_stdout = sys.stdout
+        orig_stderr = sys.stderr
+
+        currently_handling = "source"
+        src_all_names = OutputRedirectingStoreIterator(
+            src.all_objects(name_only=True))
+
+        # no way to tell at this scope whether we're talking about errors from
+        # the source or the destination
+        currently_handling = "unknown"
+
+        try:
+            result_queue = mp.Queue()
+            P = mp.Pool(
+                processes=opts.workers,
+                initializer=start_worker,
+                initargs=(result_queue,))
+
+            for i in range(opts.workers):
+                init_result = result_queue.get(timeout=60)
+                vvprint(
+                    "INIT WORKER " + init_result["worker_name"],
+                    orig_stdout)
+                if opts.collate_output:
+                    print_captured_to_stream(
+                        init_result["output"], orig_stdout, only_vv=True)
+                    print_captured_to_stream(
+                        init_result["error"], orig_stderr, only_vv=True)
+                status = init_result["status"]
+                if status == "failure":
+                    raise init_result["exc"]
+
+            for result in P.imap_unordered(sync_object, src_all_names):
+                if opts.collate_output:
+                    vvprint("STDOUT FOR " + result["name"], orig_stdout)
+                    print_captured_to_stream(result["output"], orig_stdout)
+                    vvprint("STDERR FOR " + result["name"], orig_stderr)
+                    print_captured_to_stream(
+                        result["error"], orig_stderr, only_vv=True)
+                status = result["status"]
+                if status == "failure":
+                    e = result["exc"]
+                    raise e
+        except:
+            P.terminate()
+            raise
+        finally:
+            restore_output(orig_stdout, orig_stderr)
+
+        if (opts.delete_after):
+            delete_unreferenced(src, dst)
+    except Exception as e:
+        print_obsync_exception(e, currently_handling, abort=True)
+
+    vvprint("finished.")
+    sys.exit(0)
