@@ -121,6 +121,8 @@ class ObsyncException(Exception):
             self.comment = e
         else:
             # from another exception
+            if hasattr(e, 'obsync_origin'):
+                self.obsync_origin = e.obsync_origin
             self.tb = traceback.format_exc(100000)
             self.comment = None
         self.ty = ty
@@ -1250,9 +1252,13 @@ def init_stores():
         return (src, dst)
 
     except Exception as e:
-        if not hasattr(e, 'obsync_origin'):
-            e.obsync_origin = currently_handling
-        raise
+        if isinstance(e, ObsyncException):
+            exc = e
+        else:
+            exc = ObsyncPermanentException(e)
+        if not hasattr(exc, 'obsync_origin'):
+            exc.obsync_origin = currently_handling
+        raise exc
     except KeyboardInterrupt as k:
         print repr(k) + " while initializing stores"
 
@@ -1353,12 +1359,17 @@ def sync_object(args):
             output=new_stdout,
             error=new_stderr)
     except Exception as e:
-        if not hasattr(e, 'obsync_origin'):
-            e.obsync_origin = currently_handling
+        if isinstance(e, ObsyncException):
+            exc = e
+        else:
+            exc = ObsyncTemporaryException(e)
+        if not hasattr(exc, 'obsync_origin'):
+            exc.obsync_origin = currently_handling
+        print_obsync_exception(exc, currently_handling)
         return dict(
             name=sobj.name,
             status="failure",
-            exc=e,
+            exc=exc,
             output=new_stdout,
             error=new_stderr)
     except KeyboardInterrupt as k:
@@ -1433,6 +1444,12 @@ if __name__ == "__main__":
             "loops when using this option!)")
         parser.add_option("--no-preserve-acls", action="store_true", \
             dest="no_preserve_acls", help="don't preserve ACLs when copying objects.")
+        parser.add_option("--tolerate-failures", type="int", default=0,
+            help=("Number of temporary errors that will be tolerated before "
+                "the migration is aborted.  Stacktraces from failures are "
+                "still logged, and the migration is still considered to have "
+                "failed after even one failed object.  Any permanent failure "
+                "or uncaught exception will abort the migration."))
         parser.add_option("-v", "--verbose", action="store_true", \
             dest="verbose", help="be verbose")
         parser.add_option("--collate-output", action="store_true", default=True,
@@ -1579,6 +1596,7 @@ if __name__ == "__main__":
                 if status == "failure":
                     raise init_result["exc"]
 
+            failures_tolerated = []
             for result in P.imap_unordered(sync_object, src_all_names):
                 if opts.collate_output:
                     vvprint("STDOUT FOR " + result["name"], orig_stdout)
@@ -1589,7 +1607,12 @@ if __name__ == "__main__":
                 status = result["status"]
                 if status == "failure":
                     e = result["exc"]
+                    if isinstance(e, ObsyncTemporaryException):
+                        if len(failures_tolerated) < opts.tolerate_failures:
+                            failures_tolerated.append(result["name"])
+                            continue
                     raise e
+
         except:
             P.terminate()
             raise
@@ -1598,7 +1621,18 @@ if __name__ == "__main__":
 
         if (opts.delete_after):
             delete_unreferenced(src, dst)
+
+        if failures_tolerated:
+            vvprint(
+                "MIGRATION COMPLETED WITH {0} FAILED OBJECTS!".format(
+                    len(failures_tolerated)),
+                orig_stderr)
+            raise e
     except Exception as e:
+        if failures_tolerated:
+            vvprint("FAILURES TOLERATED:\n", sys.stderr)
+            vvprint("\n".join(failures_tolerated), sys.stderr)
+        print >>sys.stderr, "TERMINAL ERROR:"
         print_obsync_exception(e, currently_handling, abort=True)
 
     vvprint("finished.")
