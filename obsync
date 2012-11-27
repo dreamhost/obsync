@@ -806,7 +806,7 @@ def swift_object_to_meta(obj):
 def meta_to_swift_object(obj, meta):
     for k,v in meta.items():
         if (k == CONTENT_TYPE_XATTR):
-            obj.metadata["Content-Type"] = v
+            obj.content_type = v
         elif (k[:len(META_XATTR_PREFIX)] == META_XATTR_PREFIX):
             k_name = k[len(META_XATTR_PREFIX):]
             obj.metadata[k_name] = v
@@ -888,6 +888,9 @@ class SwiftStore(Store):
             return
         o = self.container.create_object(obj.name)
         o.load_from_filename(local_copy.path)
+        # Clear the headers obtained from pre-existing dest object if any
+        # FIXME: Actually clear these headers on the dest object
+        o.headers = {}
         meta_to_swift_object(o, obj.meta)
         if (src_acl.acl_policy != None):
             #FIXME: no acls for swift yet
