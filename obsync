@@ -53,6 +53,10 @@ global opts
 # Translation table mapping users in the source to users in the destination.
 global xuser
 
+# Temp file names (if temp files are used)
+global temp_file_names
+temp_file_names = set()
+
 ###### Usage #######
 USAGE = """
 obsync synchronizes S3, swift and local objects. The source and destination
@@ -1097,6 +1101,7 @@ def capture_sys_handle(new_file, sys_handle_name):
             delete=False)
         new_file_wrapper.close()
         new_file = new_file_wrapper.name
+        temp_file_names.add(new_file)
 
     if isinstance(new_file, basestring):
         new_file_desc = new_file
@@ -1212,6 +1217,7 @@ def cleanup_capture_file(cap_file):
     """
     if isinstance(cap_file, basestring):
         os.unlink(cap_file)
+        temp_file_names.discard(cap_file)
 
 def init_stores():
     """Initialize source and destination Store objects.
@@ -1618,6 +1624,11 @@ if __name__ == "__main__":
             raise
         finally:
             restore_output(orig_stdout, orig_stderr)
+            # If there are any temp files remaining, we should clean them up
+            # on our way out.  cleanup_capture_file is destructive to the set
+            # so we'll iterate over a copy.
+            for temp_file_name in temp_file_names.copy():
+                cleanup_capture_file(temp_file_name)
 
         if (opts.delete_after):
             delete_unreferenced(src, dst)
