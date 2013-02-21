@@ -752,7 +752,7 @@ class S3Store(Store):
                     self.bucket.set_xml_acl(xml, k)
                 do_with_s3_retries(fn)
             except boto.exception.S3ResponseError, e:
-                print >>sys.stderr, "ERROR SETTING ACL on object '" + sobj.name + "'"
+                print >>sys.stderr, "ERROR SETTING ACL on object '" + obj.name + "'"
                 print >>sys.stderr
                 print >>sys.stderr, "************* ACL: *************"
                 print >>sys.stderr, str(xml)
@@ -1378,13 +1378,13 @@ def sync_object(args):
             exc.obsync_origin = currently_handling
         print_obsync_exception(exc, currently_handling)
         return dict(
-            name=sobj.name,
+            name=sname,
             status="failure",
             exc=exc,
             output=new_stdout,
             error=new_stderr)
     except KeyboardInterrupt as k:
-        print >>old_stderr, repr(k) + " while migrating " + sobj.name
+        print >>old_stderr, repr(k) + " while migrating " + sname
     finally:
         restore_output(old_stdout, old_stderr)
 
