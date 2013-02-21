@@ -188,9 +188,9 @@ def test_xattr_support(path):
         if xattr.get(test_file, "test", namespace=xattr.NS_USER) !=  "123":
             raise ObsyncPermanentException("test_xattr_support: failed to set an xattr and " + \
                 "read it back.")
-    except IOError, e:
+    except IOError, exc:
         print >>sys.stderr, "**** ERRROR: You do not appear to have xattr support " + \
-            "at %s ****" % pa
+            "at %s ****" % path
         raise ObsyncPermanentException(exc)
     finally:
         os.unlink(test_file)
