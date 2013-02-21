@@ -1402,6 +1402,7 @@ if __name__ == "__main__":
 
     try:
         currently_handling = "unknown"
+        failures_tolerated = []
         parser = OptionParser(USAGE)
         parser.add_option("--src-type", dest="src_type", type="string",
             action="store", help="type of data  store for source. Can be " + \
@@ -1605,7 +1606,6 @@ if __name__ == "__main__":
                 if status == "failure":
                     raise init_result["exc"]
 
-            failures_tolerated = []
             for result in P.imap_unordered(sync_object, src_all_names):
                 if opts.collate_output:
                     vvprint("STDOUT FOR " + result["name"], orig_stdout)
@@ -1646,7 +1646,8 @@ if __name__ == "__main__":
         if failures_tolerated:
             vvprint("FAILURES TOLERATED:\n", sys.stderr)
             vvprint("\n".join(failures_tolerated), sys.stderr)
-        print >>sys.stderr, "TERMINAL ERROR:"
+        if not isinstance(e, ObsyncArgumentParsingException):
+            print >>sys.stderr, "TERMINAL ERROR:"
         print_obsync_exception(e, currently_handling, abort=True)
 
     vvprint("finished.")
