@@ -705,6 +705,7 @@ class S3Store(Store):
                 if (self.bucket == None):
                     raise ObsyncPermanentException("%s: no such bucket as %s" % \
                                                        (host, self.bucket_name))
+        super(S3Store, self).__init__()
 
     def __str__(self):
         return "s3://" + self.host + "/" + self.bucket_name + "/" + self.key_prefix
@@ -853,6 +854,7 @@ class SwiftStore(Store):
             else:
                 raise ObsyncPermanentException("%s: no such container as %s" % \
                     (self.host, self.container_name))
+        super(SwiftStore, self).__init__()
 
     def __str__(self):
         return "swift://" + self.host + "/" + self.container_name + "/" + self.object_prefix
@@ -943,7 +945,7 @@ class FileStore(Store):
             mkdir_p(self.base)
         elif (not os.path.isdir(self.base)):
             raise ObsyncPermanentException("NonexistentStore")
-        Store.__init__(self, "file://" + url)
+        super(FileStore, self).__init__()
         test_xattr_support(self.base)
     def __str__(self):
         return "file://" + self.base
