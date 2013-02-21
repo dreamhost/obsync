@@ -27,3 +27,6 @@ pip-log.txt
 .mr.developer.cfg
 build-stamp
 configure-stamp
+
+#Swap files
+*.sw[l-p]
