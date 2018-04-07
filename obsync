@@ -1595,7 +1595,11 @@ if __name__ == "__main__":
                 initargs=(result_queue,))
 
             for i in range(opts.workers):
-                init_result = result_queue.get(timeout=60)
+                init_result = None
+                try:
+                    init_result = result_queue.get(timeout=60)
+                except queue.Empty:
+                    continue
                 vvprint(
                     "INIT WORKER " + init_result["worker_name"],
                     orig_stdout)
