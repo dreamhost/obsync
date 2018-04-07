@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 
 #
 # Ceph - scalable distributed file system
@@ -33,7 +33,7 @@ import logging
 import mimetypes
 import multiprocessing as mp
 import os
-import queue
+import Queue as queue # py3 made it powercase!
 import re
 import shutil
 import string
