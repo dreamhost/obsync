@@ -1455,8 +1455,12 @@ if __name__ == "__main__":
         parser.add_option("-L", "--follow-symlinks", action="store_true", \
             dest="follow_symlinks", help="follow symlinks (please avoid symlink " + \
             "loops when using this option!)")
-        parser.add_option("--no-preserve-acls", action="store_true", \
-            dest="no_preserve_acls", help="don't preserve ACLs when copying objects.")
+        # optparse doesn't allow optional arguments
+        # so we have to introduce --filter-acls
+        parser.add_option("--preserve-acls", action="store_true", \
+            dest="preserve_acls", help="Preserve ACLs when copying objects.")
+        parser.add_option("--no-preserve-acls", action="store_false", \
+            dest="preserve_acls", help="Don't preserve ACLs when copying objects.")
         parser.add_option("--tolerate-failures", type="int", default=0,
             help=("Number of temporary errors that will be tolerated before "
                 "the migration is aborted.  Stacktraces from failures are "
@@ -1546,7 +1550,6 @@ if __name__ == "__main__":
             opts.src_host = opts.src_authurl
         if opts.dst_authurl:
             opts.dst_host = opts.dst_authurl
-        opts.preserve_acls = not opts.no_preserve_acls
         if (opts.create and opts.dry_run):
             raise ObsyncArgumentParsingException("You can't run with both \
     --create-dest and --dry-run! By definition, a dry run never changes anything.")
