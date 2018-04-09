@@ -520,6 +520,7 @@ def compare_xml(xml1, xml2):
 
 #<?xml version="1.0" encoding="UTF-8"?>
 def test_acl_policy():
+    # Known bug: the exact order of Grants is not significant.
     test1_xml = """\
 <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
     <Owner>
@@ -527,6 +528,18 @@ def test_acl_policy():
         <DisplayName>MrFoo</DisplayName>
     </Owner>
     <AccessControlList>
+        <Grant>
+            <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Group">
+                <URI>http://acs.amazonaws.com/groups/global/AuthenticatedUsers</URI>
+            </Grantee>
+            <Permission>READ</Permission>
+        </Grant>
+        <Grant>
+            <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="AmazonCustomerByEmail">
+                <EmailAddress>Grantees@email.com</EmailAddress>
+            </Grantee>
+            <Permission>READ_ACP</Permission>
+        </Grant>
         <Grant>
             <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
                 <ID>bar</ID>
