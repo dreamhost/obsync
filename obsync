@@ -417,18 +417,30 @@ class AclPolicy(object):
         grants = { }
         for g in grantlist:
             grantee = g.find("{%s}Grantee" % NS)
-            user_id = grantee.find("{%s}ID" % NS).text
+            # Grantee type
             if (grantee.attrib.has_key("type")):
                 user_type = grantee.attrib["type"]
             else:
                 user_type = grantee.attrib["{%s}type" % NS2]
+            user_type_match = grantee_attribute_to_user_type(user_type)
+            # Grantee entity
+            if user_type == ACL_TYPE_CANON_USER:
+                user_id_elementname = "ID"
+            elif user_type == ACL_TYPE_EMAIL_USER:
+                user_id_elementname = "EmailAddress"
+            elif user_type == ACL_TYPE_GROUP:
+                user_id_elementname = "URI"
+            user_id = grantee.find("{%s}%s" % (NS, user_id_elementname)).text
+            # Grantee DisplayName
             display_name_node = grantee.find("{%s}DisplayName" % NS)
-            if (display_name_node != None):
-                display_name = grantee.find("{%s}DisplayName" % NS).text
+            if display_name_node is not None:
+                display_name = display_name_node.text
             else:
                 display_name = None
+            # Grantee Permission
             permission = g.find("{%s}Permission" % NS).text
-            grant_user_id = grantee_attribute_to_user_type(user_type) + user_id
+            # done
+            grant_user_id = user_type_match + user_id
             grants[grant_user_id] = AclGrant(grant_user_id, display_name, permission)
         return AclPolicy(owner_id, owner_display_name, grants)
     def to_xml(self):
@@ -444,15 +456,22 @@ class AclPolicy(object):
             grant_elem = etree.SubElement(access_control_list, "Grant")
             grantee_elem = etree.SubElement(grant_elem, "{%s}Grantee" % NS,
                 nsmap={None: NS, "xsi" : NS2})
-            grantee_elem.set("{%s}type" % NS2, user_type_to_attr(get_user_type(g.user_id)))
-            user_id_elem = etree.SubElement(grantee_elem, "{%s}ID" % NS)
+            user_type = get_user_type(g.user_id)
+            grantee_elem.set("{%s}type" % NS2, user_type_to_attr(user_type))
+            if user_type == ACL_TYPE_CANON_USER:
+                user_id_elementname = "ID"
+            elif user_type == ACL_TYPE_EMAIL_USER:
+                user_id_elementname = "EmailAddress"
+            elif user_type == ACL_TYPE_GROUP:
+                user_id_elementname = "URI"
+            user_id_elem = etree.SubElement(grantee_elem, "{%s}%s" % (NS, user_id_elementname))
             user_id_elem.text = strip_user_type(g.user_id)
             if (g.display_name != None):
                 display_name_elem = etree.SubElement(grantee_elem, "{%s}DisplayName" % NS)
                 display_name_elem.text = g.display_name
             permission_elem = etree.SubElement(grant_elem, "{%s}Permission" % NS)
             permission_elem.text = g.permission
-        return etree.tostring(root, encoding="UTF-8")
+        return etree.tostring(root, encoding="UTF-8", pretty_print=True)
     def translate_users(self, xusers):
         # Owner ids are always expressed in terms of canonical user id
         if (xusers.has_key(ACL_TYPE_CANON_USER + self.owner_id)):
