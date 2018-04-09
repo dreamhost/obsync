@@ -1383,6 +1383,8 @@ def sync_object(args):
             dst_acl = dst_store.get_acl(dobj)
             currently_handling = "source"
             src_acl.translate_users(xuser)
+            vvprint("SRC ACL: " + src_acl.acl_policy.to_xml())
+            vvprint("SRC DST: " + dst_acl.acl_policy.to_xml())
             #src_acl.set_owner()
             if (not src_acl.equals(dst_acl)):
                 upload = True
