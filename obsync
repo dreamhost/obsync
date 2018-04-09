@@ -506,10 +506,11 @@ class AclPolicy(object):
         return True
 
 def compare_xml(xml1, xml2):
-    tree1 = etree.parse(StringIO(xml1))
-    out1 = etree.tostring(tree1, encoding="UTF-8")
-    tree2 = etree.parse(StringIO(xml2))
-    out2 = etree.tostring(tree2, encoding="UTF-8")
+    parser = etree.XMLParser(remove_blank_text=True)
+    tree1 = etree.parse(StringIO(xml1), parser=parser)
+    out1 = etree.tostring(tree1, encoding="UTF-8", pretty_print=True)
+    tree2 = etree.parse(StringIO(xml2), parser=parser)
+    out2 = etree.tostring(tree2, encoding="UTF-8", pretty_print=True)
     out1 = out1.replace("xsi:type", "type")
     out2 = out2.replace("xsi:type", "type")
     if out1 != out2:
