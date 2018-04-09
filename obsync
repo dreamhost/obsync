@@ -343,9 +343,11 @@ def grantee_attribute_to_user_type(utype):
         return ACL_TYPE_CANON_USER
     elif (utype == "Group"):
         return ACL_TYPE_GROUP
-    elif (utype == "Email User"):
+    elif (utype == "Email User"): # Obsolete variant
         return ACL_TYPE_EMAIL_USER
-    elif (utype == "EmailUser"):
+    elif (utype == "EmailUser"): # Obsolete variant
+        return ACL_TYPE_EMAIL_USER
+    elif (utype == "AmazonCustomerByEmail"):
         return ACL_TYPE_EMAIL_USER
     else:
         raise ObsyncPermanentException("unknown user type for user %s" % utype)
@@ -356,7 +358,7 @@ def user_type_to_attr(t):
     elif (t == ACL_TYPE_GROUP):
         return "Group"
     elif (t ==  ACL_TYPE_EMAIL_USER):
-        return "EmailUser"
+        return "AmazonCustomerByEmail"
     else:
         raise ObsyncPermanentException("unknown user type %s" % t)
 
